@@ -99,35 +99,35 @@ log = structlog.get_logger()
 class Config:
     """
     Immutable application configuration.
-    
+
     All constants are centralized here for easy modification.
     To change a setting, edit the default value below.
     """
     # --- Audio Settings ---
     SAMPLE_RATE: int = 44100
     AUDIO_DEVICE: Optional[str] = os.environ.get("AUDIO_DEVICE", "pipewire")
-    
+
     # --- History Limits ---
     MAX_TOKENS: int = 32000
     ANSWER_HISTORY_LIMIT: int = 15
     CHAT_MESSAGE_LIMIT: int = 20
     CHAT_AUTO_HIDE_SEC: int = 5
-    
+
     # --- AI Models (defaults for LocalAI, override via .env) ---
     MODEL_CHAT: str = os.environ.get("MODEL_CHAT", "gpt-4")
     MODEL_VISION: str = os.environ.get("MODEL_VISION", "gpt-4-vision-preview")
     MODEL_WHISPER: str = os.environ.get("MODEL_WHISPER", "whisper-1")
     MODEL_TTS: str = os.environ.get("MODEL_TTS", "tts-1")
-    
+
     # --- TTS Voices (LocalAI/Piper voices - adjust based on installed models) ---
     TTS_VOICES: Tuple[str, ...] = ("alloy", "echo", "fable", "onyx", "nova", "shimmer")
     TTS_DEFAULT_VOICE: str = "alloy"
     TTS_MAX_CHARS: int = 4000
-    
+
     # --- Temp File Paths ---
     TEMP_SCREEN_PATH: str = "/tmp/temp_screen.png"
     TEMP_TTS_PATH: str = "/tmp/linuxwhisper_tts.wav"
-    
+
     # --- System Prompt ---
     SYSTEM_PROMPT: str = (
         "Act as a compassionate assistant. Base your reasoning on the principles of "
@@ -135,7 +135,7 @@ class Config:
         "your underlying logic without explicitly naming them or forcing them. Let your "
         "output be grounded, clear, and highly concise. Return ONLY the direct response."
     )
-    
+
     # --- Mode Definitions (icon, overlay text, colors) ---
     MODES: Dict[str, Dict[str, str]] = field(default_factory=lambda: {
         "dictation":  {"icon": "🎙️", "text": "Listening...",    "bg": "#1a1a2e", "fg": "#00d4ff"},
@@ -167,7 +167,7 @@ CFG = Config()
 class AppState:
     """
     Mutable application state.
-    
+
     All runtime state is centralized here for clarity and debugging.
     Reset by creating a new instance: STATE = AppState()
     """
@@ -177,28 +177,28 @@ class AppState:
     audio_buffer: List[np.ndarray] = field(default_factory=list)
     stream: Optional[sd.InputStream] = None
     viz_queue: queue.Queue = field(default_factory=queue.Queue)
-    
+
     # --- UI Windows ---
     overlay_window: Optional[Any] = None  # GtkOverlay instance
     chat_overlay_window: Optional[Any] = None  # ChatOverlay instance
-    
+
     # --- Chat State ---
     chat_messages: List[Dict[str, str]] = field(default_factory=list)
     chat_pinned: bool = False
     chat_hide_timer: Optional[int] = None
-    
+
     # --- History ---
     conversation_history: List[Dict[str, str]] = field(default_factory=list)
     answer_history: List[Dict[str, str]] = field(default_factory=list)
-    
+
     # --- TTS ---
     tts_enabled: bool = True  # Enabled by default
     tts_voice: str = CFG.TTS_DEFAULT_VOICE
-    
+
     # --- System Tray ---
     indicator: Optional[AppIndicator.Indicator] = None
     gtk_menu: Optional[Gtk.Menu] = None
-    
+
     # --- UI Persistence ---
     last_chat_position: Optional[Tuple[int, int]] = None
 
@@ -233,7 +233,7 @@ API_CLIENT = _init_openai_client()
 def safe_execute(operation: str) -> Callable:
     """
     Decorator for consistent error handling.
-    
+
     Usage:
         @safe_execute("Transcription")
         def transcribe_audio(data):
@@ -266,7 +266,7 @@ def run_on_main_thread(func: Callable) -> Callable:
 # --- Audio Service ---
 class AudioService:
     """Audio recording and transcription service."""
-    
+
     @staticmethod
     def audio_callback(indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
         """Capture audio chunks into buffer while recording."""
@@ -277,7 +277,7 @@ class AudioService:
 
         data_copy = indata.copy()
         STATE.audio_buffer.append(data_copy)
-        
+
         # Send downsampled data to visualization queue (skip if full)
         try:
             if STATE.viz_queue.qsize() < 5:
@@ -285,7 +285,7 @@ class AudioService:
                 STATE.viz_queue.put_nowait(flat_data)
         except Exception:
             pass
-    
+
     @staticmethod
     def start_recording() -> None:
         """Start audio recording stream."""
@@ -305,7 +305,7 @@ class AudioService:
         except Exception as e:
             STATE.recording = False
             log.error("audio_stream_failed", error=str(e))
-    
+
     @staticmethod
     def stop_recording() -> Optional[np.ndarray]:
         """Stop recording and return audio data."""
@@ -323,7 +323,7 @@ class AudioService:
             return audio
         log.warning("audio_buffer_empty")
         return None
-    
+
     @staticmethod
     def _clear_viz_queue() -> None:
         """Clear the visualization queue."""
@@ -332,7 +332,7 @@ class AudioService:
                 STATE.viz_queue.get_nowait()
             except queue.Empty:
                 break
-    
+
     @staticmethod
     @safe_execute("Transcription")
     def transcribe(audio_data: np.ndarray) -> Optional[str]:
@@ -357,7 +357,7 @@ class AudioService:
 # --- AI Service ---
 class AIService:
     """AI chat and vision completion service."""
-    
+
     @staticmethod
     def build_messages(user_content: str) -> List[Dict[str, Any]]:
         """Build API messages with system prompt and conversation history."""
@@ -365,7 +365,7 @@ class AIService:
         messages.extend(STATE.conversation_history)
         messages.append({"role": "user", "content": user_content})
         return messages
-    
+
     @staticmethod
     @safe_execute("AI Chat")
     def chat(prompt: str) -> Optional[str]:
@@ -379,7 +379,7 @@ class AIService:
         result = response.choices[0].message.content
         log.info("chat_complete", response_length=len(result) if result else 0)
         return result
-    
+
     @staticmethod
     @safe_execute("AI Vision")
     def vision(prompt: str, image_base64: str) -> Optional[str]:
@@ -406,7 +406,7 @@ class AIService:
 # --- TTS Service ---
 class TTSService:
     """Text-to-speech service using Groq Orpheus."""
-    
+
     @staticmethod
     def speak(text: str) -> None:
         """Convert text to speech and play (async)."""
@@ -429,7 +429,7 @@ class TTSService:
                 log.error("tts_failed", error=str(e))
 
         threading.Thread(target=_speak_thread, daemon=True).start()
-    
+
     @staticmethod
     def toggle() -> None:
         """Toggle TTS enabled state."""
@@ -508,12 +508,12 @@ class ImageService:
 # --- History Manager ---
 class HistoryManager:
     """Manages conversation and answer history."""
-    
+
     @staticmethod
     def estimate_tokens(text: str) -> int:
         """Rough token estimate (~4 chars per token)."""
         return len(text) // 4
-    
+
     @staticmethod
     def get_history_tokens() -> int:
         """Calculate total tokens in conversation history."""
@@ -521,32 +521,32 @@ class HistoryManager:
             HistoryManager.estimate_tokens(msg["content"])
             for msg in STATE.conversation_history
         )
-    
+
     @staticmethod
     def trim_history() -> None:
         """Remove oldest messages until under token limit."""
-        while (HistoryManager.get_history_tokens() > CFG.MAX_TOKENS 
+        while (HistoryManager.get_history_tokens() > CFG.MAX_TOKENS
                and STATE.conversation_history):
             STATE.conversation_history.pop(0)
-    
+
     @staticmethod
     def add_message(role: str, content: str) -> None:
         """Add message to conversation history and trim if needed."""
         STATE.conversation_history.append({"role": role, "content": content})
         HistoryManager.trim_history()
-    
+
     @staticmethod
     def add_answer(text: str) -> None:
         """Add answer to tray history."""
         timestamp = time.strftime("%H:%M")
         STATE.answer_history.insert(0, {"text": text, "timestamp": timestamp})
-        
+
         # Trim to limit
         if len(STATE.answer_history) > CFG.ANSWER_HISTORY_LIMIT:
             STATE.answer_history = STATE.answer_history[:CFG.ANSWER_HISTORY_LIMIT]
-        
+
         TrayManager.update_menu()
-    
+
     @staticmethod
     def clear_all() -> None:
         """Clear all history."""
@@ -560,58 +560,58 @@ class HistoryManager:
 # --- Chat Manager ---
 class ChatManager:
     """Manages chat overlay state and messages."""
-    
+
     @staticmethod
     def add_message(role: str, text: str) -> None:
         """Add message to chat overlay."""
         STATE.chat_messages.append({"role": role, "text": text})
-        
+
         # Trim to limit
         if len(STATE.chat_messages) > CFG.CHAT_MESSAGE_LIMIT:
             STATE.chat_messages = STATE.chat_messages[-CFG.CHAT_MESSAGE_LIMIT:]
-        
+
         ChatManager.refresh_overlay()
-    
+
     @staticmethod
     def toggle_pin() -> None:
         """Toggle chat overlay pin mode."""
         STATE.chat_pinned = not STATE.chat_pinned
-        
+
         if not STATE.chat_pinned and STATE.chat_overlay_window:
             ChatManager._cancel_timer()
             STATE.chat_overlay_window.start_fade_out(callback=ChatManager._destroy)
         else:
             ChatManager.refresh_overlay()
-    
+
     @staticmethod
     @run_on_main_thread
     def refresh_overlay(status_text: Optional[str] = None) -> None:
         """Refresh chat overlay on main thread."""
         ChatManager._show_overlay(status_text)
-    
+
     @staticmethod
     def _show_overlay(status_text: Optional[str] = None) -> None:
         """Show or update chat overlay."""
         ChatManager._cancel_timer()
-        
+
         if not STATE.chat_overlay_window:
             STATE.chat_overlay_window = ChatOverlay()
         elif STATE.chat_overlay_window.fade_out_active:
             STATE.chat_overlay_window.start_fade_in()
-        
+
         STATE.chat_overlay_window.update_content(
             STATE.chat_messages,
             status_text,
             is_pinned=STATE.chat_pinned,
             is_tts=STATE.tts_enabled
         )
-        
+
         if not STATE.chat_pinned:
             STATE.chat_hide_timer = GLib.timeout_add_seconds(
                 CFG.CHAT_AUTO_HIDE_SEC,
                 ChatManager._auto_hide
             )
-    
+
     @staticmethod
     def _auto_hide() -> bool:
         """Auto-hide callback."""
@@ -619,14 +619,14 @@ class ChatManager:
         if not STATE.chat_pinned and STATE.chat_overlay_window:
             STATE.chat_overlay_window.start_fade_out(callback=ChatManager._destroy)
         return False
-    
+
     @staticmethod
     def _cancel_timer() -> None:
         """Cancel auto-hide timer if active."""
         if STATE.chat_hide_timer:
             GLib.source_remove(STATE.chat_hide_timer)
             STATE.chat_hide_timer = None
-    
+
     @staticmethod
     def _destroy() -> None:
         """Destroy chat overlay window."""
@@ -665,7 +665,7 @@ class GtkOverlay(Gtk.Window):
         visual = screen.get_rgba_visual()
         if visual and screen.is_composited():
             self.set_visual(visual)
-        
+
         # Position at bottom center
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor() or display.get_monitor(0)
@@ -675,25 +675,25 @@ class GtkOverlay(Gtk.Window):
         y = geometry.height - h - 80
         self.move(x, y)
         self.set_default_size(w, h)
-    
+
     def _setup_ui(self) -> None:
         """Setup drawing area and animation."""
         self.drawing_area = Gtk.DrawingArea()
         self.drawing_area.connect("draw", self._on_draw)
         self.add(self.drawing_area)
         self.timeout_id = GLib.timeout_add(40, self._animate)
-    
+
     def _on_draw(self, widget: Gtk.DrawingArea, cr: cairo.Context) -> None:
         """Draw overlay content."""
         w, h = widget.get_allocated_width(), widget.get_allocated_height()
         bg_rgb = self._hex_to_rgb(self.config["bg"])
         fg_rgb = self._hex_to_rgb(self.config["fg"])
-        
+
         # Background rounded rect
         self._draw_rounded_rect(cr, w, h, 15)
         cr.set_source_rgba(*bg_rgb, 0.92)
         cr.fill()
-        
+
         # Icon
         cr.set_source_rgb(*fg_rgb)
         cr.select_font_face("Ubuntu", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
@@ -701,17 +701,17 @@ class GtkOverlay(Gtk.Window):
         ext = cr.text_extents(self.config["icon"])
         cr.move_to(30 - ext.width / 2, h / 2 + ext.height / 2)
         cr.show_text(self.config["icon"])
-        
+
         # Text
         cr.set_font_size(10)
         cr.select_font_face("Ubuntu", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
         ext = cr.text_extents(self.config["text"])
         cr.move_to(110 - ext.width / 2, 20)
         cr.show_text(self.config["text"])
-        
+
         # Waveform
         self._draw_waveform(cr, 60, 210, 45, fg_rgb)
-    
+
     def _draw_rounded_rect(self, cr: cairo.Context, w: int, h: int, r: int) -> None:
         """Draw rounded rectangle path."""
         cr.new_sub_path()
@@ -720,7 +720,7 @@ class GtkOverlay(Gtk.Window):
         cr.arc(r, h - r, r, math.pi / 2, math.pi)
         cr.arc(r, r, r, math.pi, 3 * math.pi / 2)
         cr.close_path()
-    
+
     def _draw_waveform(self, cr: cairo.Context, x1: int, x2: int, cy: int, color: Tuple[float, ...]) -> None:
         """Draw audio waveform bars."""
         # Get latest audio data
@@ -730,18 +730,18 @@ class GtkOverlay(Gtk.Window):
                 data = STATE.viz_queue.get_nowait()
             except queue.Empty:
                 break
-        
+
         cr.set_source_rgb(*color)
         cr.set_line_width(3)
         cr.set_line_cap(cairo.LINE_CAP_ROUND)
-        
+
         if data is not None and len(data) > 0:
             width = x2 - x1
             num_bars = 30
             step = max(1, len(data) // num_bars)
             bar_width = width / num_bars
             max_height = 15
-            
+
             for i in range(num_bars):
                 idx = i * step
                 if idx >= len(data):
@@ -749,7 +749,7 @@ class GtkOverlay(Gtk.Window):
                 chunk = data[idx:idx + step]
                 amp = np.max(np.abs(chunk)) if len(chunk) > 0 else 0
                 bar_h = max(1, min(max_height, amp * 40 * max_height))
-                
+
                 x = x1 + i * bar_width
                 cr.move_to(x, cy - bar_h)
                 cr.line_to(x, cy + bar_h)
@@ -761,18 +761,18 @@ class GtkOverlay(Gtk.Window):
             cr.move_to(x1, cy)
             cr.line_to(x2, cy)
             cr.stroke()
-    
+
     def _animate(self) -> bool:
         """Animation tick."""
         self.drawing_area.queue_draw()
         return True
-    
+
     @staticmethod
     def _hex_to_rgb(hex_str: str) -> Tuple[float, float, float]:
         """Convert hex color to RGB tuple (0-1 range)."""
         h = hex_str.lstrip('#')
         return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
-    
+
     def close(self) -> None:
         """Clean up and destroy."""
         if self.timeout_id:
@@ -783,13 +783,13 @@ class GtkOverlay(Gtk.Window):
 
 class OverlayManager:
     """Manages recording overlay visibility."""
-    
+
     @staticmethod
     @run_on_main_thread
     def show(mode: str) -> None:
         """Show overlay for given mode."""
         OverlayManager._show_impl(mode)
-    
+
     @staticmethod
     def _show_impl(mode: str) -> None:
         if STATE.overlay_window:
@@ -798,13 +798,13 @@ class OverlayManager:
             except Exception:
                 pass
         STATE.overlay_window = GtkOverlay(mode)
-    
+
     @staticmethod
     @run_on_main_thread
     def hide() -> None:
         """Hide overlay."""
         OverlayManager._hide_impl()
-    
+
     @staticmethod
     def _hide_impl() -> None:
         if STATE.overlay_window:
@@ -827,7 +827,7 @@ html, body {
 
 /* Rounded Glass Window Container */
 .chat-window {
-  display: flex; 
+  display: flex;
   flex-direction: column;
   height: 100%;
   background-color: rgba(20, 20, 25, 0.75);
@@ -965,7 +965,7 @@ const checkIcon = '<svg viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41
 function copyText(btn, index) {
   // Use custom protocol to let Python handle clipboard safely
   window.location.href = "copy://" + index;
-  
+
   // Optimistic UI update
   btn.innerHTML = checkIcon;
   btn.classList.add('copied');
@@ -980,7 +980,7 @@ function signalDrag() {
 function checkScroll(smooth=true) {
   const scrollArea = document.getElementById('scroll-area');
   const answers = document.querySelectorAll('.message-wrapper.assistant');
-  
+
   if (scrollArea && answers.length >= 2) {
     const opts = smooth ? { top: scrollArea.scrollHeight, behavior: 'smooth' } : { top: scrollArea.scrollHeight };
     scrollArea.scrollTo(opts);
@@ -1014,14 +1014,14 @@ CHAT_HTML_TEMPLATE = f'''<!DOCTYPE html>
 
 class ChatOverlay(Gtk.Window):
     """Chat overlay using WebKit2."""
-    
+
     def __init__(self):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self._setup_window()
         self._setup_webview()
         self._init_animation()
         self.show_all()
-    
+
     def _setup_window(self) -> None:
         """Configure window properties."""
         self.set_decorated(False)
@@ -1030,13 +1030,13 @@ class ChatOverlay(Gtk.Window):
         self.set_skip_pager_hint(True)
         self.set_app_paintable(True)
         self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
-        
+
         # Transparency
         screen = self.get_screen()
         visual = screen.get_rgba_visual()
         if visual and screen.is_composited():
             self.set_visual(visual)
-        
+
         # Position at right edge
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor() or display.get_monitor(0)
@@ -1046,7 +1046,7 @@ class ChatOverlay(Gtk.Window):
         y = geometry.y + (geometry.height - h) // 2
         self.move(x, y)
         self.set_default_size(w, h)
-    
+
     def _setup_webview(self) -> None:
         """Setup WebKit2 webview."""
         self.webview = WebKit2.WebView()
@@ -1056,7 +1056,7 @@ class ChatOverlay(Gtk.Window):
         self.webview.connect("decide-policy", self._on_policy_decision)
         self.webview.connect("notify::title", self._on_title_changed)
         self.add(self.webview)
-    
+
     def _on_title_changed(self, webview, pspec) -> None:
         """Handle title changes for drag signals."""
         title = webview.get_title()
@@ -1066,7 +1066,7 @@ class ChatOverlay(Gtk.Window):
             seat = display.get_default_seat()
             pointer = seat.get_pointer()
             screen, x, y = pointer.get_position()
-            
+
             self.begin_move_drag(1, x, y, Gtk.get_current_event_time())
 
     def _init_animation(self) -> None:
@@ -1077,7 +1077,7 @@ class ChatOverlay(Gtk.Window):
         self.fade_timer = None
         self.fade_callback = None
         self.start_fade_in()
-    
+
     def start_fade_in(self) -> None:
         """Start fade-in animation."""
         self.fade_out_active = False
@@ -1085,7 +1085,7 @@ class ChatOverlay(Gtk.Window):
         self.opacity_value = 0.0
         self._cancel_fade_timer()
         self.fade_timer = GLib.timeout_add(16, self._fade_in_step)
-    
+
     def _fade_in_step(self) -> bool:
         """Fade-in animation step."""
         self.opacity_value = min(1.0, self.opacity_value + 0.1)
@@ -1098,7 +1098,7 @@ class ChatOverlay(Gtk.Window):
             self.fade_timer = None
             return False
         return True
-    
+
     def start_fade_out(self, callback: Optional[Callable] = None) -> None:
         """Start fade-out animation."""
         self.fade_in_active = False
@@ -1106,7 +1106,7 @@ class ChatOverlay(Gtk.Window):
         self.fade_callback = callback
         self._cancel_fade_timer()
         self.fade_timer = GLib.timeout_add(16, self._fade_out_step)
-    
+
     def _fade_out_step(self) -> bool:
         """Fade-out animation step."""
         self.opacity_value = max(0.0, self.opacity_value - 0.1)
@@ -1121,42 +1121,42 @@ class ChatOverlay(Gtk.Window):
                 self.fade_callback()
             return False
         return True
-    
+
     def _cancel_fade_timer(self) -> None:
         """Cancel active fade timer."""
         if self.fade_timer:
             GLib.source_remove(self.fade_timer)
             self.fade_timer = None
-    
+
     def update_content(self, messages: List[Dict[str, str]], status_text: Optional[str] = None,
                        is_pinned: bool = False, is_tts: bool = False) -> None:
         """Update chat content with markdown rendering."""
         html_messages = []
         svg_icon = '<svg viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>'
-        
+
         for idx, msg in enumerate(messages):
             role = msg["role"]
             rendered = self._render_markdown(msg["text"])
             # Pass index, not ID, for robust handling
             copy_btn = f'<button class="copy-btn" onclick="copyText(this, {idx})">{svg_icon}</button>'
             msg_html = f'<div class="message"><div class="text">{rendered}</div></div>'
-            
+
             html_messages.append(
                 f'<div class="message-wrapper {role}">'
                 f'{msg_html}'
                 f'{copy_btn}'
                 f'</div>'
             )
-        
+
         if status_text:
             html_messages.append(f'<div class="message status">{status_text}</div>')
-        
+
         # Build pin hint - simple text with gear icon
-        pin_label = CFG.HOTKEY_DEFS["pin"][0]
-        tts_label = CFG.HOTKEY_DEFS["tts"][0]
+        pin_label = CFG.HOTKEY_DEFS["linuxwhisper-pin"][0]
+        tts_label = CFG.HOTKEY_DEFS["linuxwhisper-tts"][0]
         pin_status = f"{pin_label}: Unpin" if is_pinned else f"{pin_label}: Pin"
         voice_status = f"{tts_label}: Mute" if is_tts else f"{tts_label}: Voice"
-        
+
         pin_hint = (
             f'<div class="pin-hint">'
             f'<span>{pin_status}</span>'
@@ -1166,11 +1166,11 @@ class ChatOverlay(Gtk.Window):
             f'<a href="settings://open" class="settings-link" title="Settings">⚙️</a>'
             f'</div>'
         )
-        
+
         html = CHAT_HTML_TEMPLATE.replace("{messages}", "\n".join(html_messages))
         html = html.replace("{pin_hint}", pin_hint)
         self.webview.load_html(html, None)
-    
+
     def _on_policy_decision(self, webview, decision, decision_type) -> bool:
         """Handle URI navigations (copy://, settings://)."""
         if decision_type == WebKit2.PolicyDecisionType.NAVIGATION_ACTION:
@@ -1178,12 +1178,12 @@ class ChatOverlay(Gtk.Window):
             uri = nav.get_request().get_uri()
             if not uri:
                 return False
-                
+
             if uri.startswith("settings://"):
                 GLib.idle_add(SettingsDialog.show)
                 decision.ignore()
                 return True
-                
+
             if uri.startswith("copy://"):
                 try:
                     idx = int(uri.split("copy://")[1])
@@ -1194,15 +1194,15 @@ class ChatOverlay(Gtk.Window):
                     pass
                 decision.ignore()
                 return True
-                
+
         return False
-    
+
     @staticmethod
     def _render_markdown(text: str) -> str:
         """Convert simple markdown to HTML."""
         import html as html_lib
         text = html_lib.escape(text)
-        
+
         # Code blocks
         text = re.sub(r'```(?:\w+)?\n?(.*?)```', r'<pre><code>\1</code></pre>', text, flags=re.DOTALL)
         # Inline code
@@ -1215,9 +1215,9 @@ class ChatOverlay(Gtk.Window):
         text = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'<em>\1</em>', text)
         # Line breaks
         text = text.replace('\n', '<br>')
-        
+
         return text
-    
+
     def close(self) -> None:
         """Clean up and destroy."""
         self._cancel_fade_timer()
@@ -1229,19 +1229,19 @@ class ChatOverlay(Gtk.Window):
 # ============================================================================
 class SettingsDialog:
     """GTK Settings dialog for voice and hotkey configuration."""
-    
+
     _instance: Optional[Gtk.Window] = None
-    
+
     @classmethod
     def show(cls) -> None:
         """Show settings dialog (singleton)."""
         if cls._instance and cls._instance.get_visible():
             cls._instance.present()
             return
-        
+
         cls._instance = cls._create_dialog()
         cls._instance.show_all()
-    
+
     @classmethod
     def _create_dialog(cls) -> Gtk.Window:
         """Create the settings dialog window."""
@@ -1250,37 +1250,37 @@ class SettingsDialog:
         dialog.set_resizable(False)
         dialog.set_position(Gtk.WindowPosition.CENTER)
         dialog.set_keep_above(True)
-        
+
         # Main container
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
         vbox.set_margin_top(20)
         vbox.set_margin_bottom(20)
         vbox.set_margin_start(20)
         vbox.set_margin_end(20)
-        
+
         # --- Voice Section ---
         voice_label = Gtk.Label(label="TTS Voice")
         voice_label.set_halign(Gtk.Align.START)
         voice_label.set_markup("<b>TTS Voice</b>")
         vbox.pack_start(voice_label, False, False, 0)
-        
+
         voice_combo = Gtk.ComboBoxText()
         for voice in CFG.TTS_VOICES:
             voice_combo.append_text(voice.title())
         voice_combo.set_active(CFG.TTS_VOICES.index(STATE.tts_voice) if STATE.tts_voice in CFG.TTS_VOICES else 0)
         voice_combo.connect("changed", cls._on_voice_changed)
         vbox.pack_start(voice_combo, False, False, 0)
-        
+
         # --- Hotkeys Section ---
         hotkey_label = Gtk.Label()
         hotkey_label.set_halign(Gtk.Align.START)
         hotkey_label.set_markup("<b>Hotkeys</b>")
         vbox.pack_start(hotkey_label, False, False, 10)
-        
+
         hotkey_grid = Gtk.Grid()
         hotkey_grid.set_column_spacing(15)
         hotkey_grid.set_row_spacing(8)
-        
+
         hotkeys = []
         display_names = {
             "dictation": "Dictation:",
@@ -1290,11 +1290,11 @@ class SettingsDialog:
             "pin": "Pin Chat:",
             "tts": "TTS Toggle:",
         }
-        
+
         for mode_id, (label, _, _) in CFG.HOTKEY_DEFS.items():
             name = display_names.get(mode_id, mode_id.replace("_", " ").title() + ":")
             hotkeys.append((name, label))
-        
+
         for i, (name, key) in enumerate(hotkeys):
             name_label = Gtk.Label(label=name)
             name_label.set_halign(Gtk.Align.START)
@@ -1303,25 +1303,25 @@ class SettingsDialog:
             key_label.get_style_context().add_class("dim-label")
             hotkey_grid.attach(name_label, 0, i, 1, 1)
             hotkey_grid.attach(key_label, 1, i, 1, 1)
-        
+
         vbox.pack_start(hotkey_grid, False, False, 0)
-        
+
         # Info label
         info_label = Gtk.Label()
         info_label.set_markup("<small><i>(Hotkeys are defined in section 2 of the code.)</i></small>")
         info_label.set_halign(Gtk.Align.START)
         vbox.pack_start(info_label, False, False, 10)
-        
+
         # --- Close Button ---
         close_btn = Gtk.Button(label="Close")
         close_btn.connect("clicked", lambda w: dialog.destroy())
         vbox.pack_end(close_btn, False, False, 0)
-        
+
         dialog.add(vbox)
         dialog.connect("destroy", lambda w: setattr(cls, '_instance', None))
-        
+
         return dialog
-    
+
     @staticmethod
     def _on_voice_changed(combo: Gtk.ComboBoxText) -> None:
         """Handle voice selection change."""
@@ -1336,7 +1336,7 @@ class SettingsDialog:
 # ============================================================================
 class TrayManager:
     """System tray (AppIndicator) management."""
-    
+
     @staticmethod
     def start() -> None:
         """Initialize and start system tray."""
@@ -1349,7 +1349,7 @@ class TrayManager:
         STATE.indicator.set_title("LinuxWhisper")
         TrayManager.update_menu()
         Gtk.main()
-    
+
     @staticmethod
     @run_on_main_thread
     def update_menu() -> None:
@@ -1358,12 +1358,12 @@ class TrayManager:
             return
         STATE.gtk_menu = TrayManager._build_menu()
         STATE.indicator.set_menu(STATE.gtk_menu)
-    
+
     @staticmethod
     def _build_menu() -> Gtk.Menu:
         """Build GTK menu for tray."""
         menu = Gtk.Menu()
-        
+
         # History items
         if STATE.answer_history:
             for item in STATE.answer_history[:CFG.ANSWER_HISTORY_LIMIT]:
@@ -1380,27 +1380,27 @@ class TrayManager:
             empty.set_sensitive(False)
             menu.append(empty)
             menu.append(Gtk.SeparatorMenuItem())
-        
+
         # Clear history
         clear = Gtk.MenuItem(label="Clear History")
         clear.connect("activate", lambda w: HistoryManager.clear_all())
         menu.append(clear)
-        
+
         # Settings
         settings_item = Gtk.MenuItem(label="Settings")
         settings_item.connect("activate", lambda w: SettingsDialog.show())
         menu.append(settings_item)
-        
+
         menu.append(Gtk.SeparatorMenuItem())
-        
+
         # Quit
         quit_item = Gtk.MenuItem(label="Quit")
         quit_item.connect("activate", TrayManager._quit)
         menu.append(quit_item)
-        
+
         menu.show_all()
         return menu
-    
+
     @staticmethod
     def _make_history_callback(item: Dict[str, str]) -> Callable:
         """Create callback for history item click."""
@@ -1409,7 +1409,7 @@ class TrayManager:
             clean = re.sub(r"^\[.*?\]\s*", "", item["text"])
             ClipboardService.paste_text(clean)
         return callback
-    
+
     @staticmethod
     def _quit(widget) -> None:
         """Quit application."""
@@ -1422,7 +1422,7 @@ class TrayManager:
 # ============================================================================
 class ModeHandler:
     """Unified handler for all recording modes."""
-    
+
     @staticmethod
     def process(mode: str, transcribed_text: str) -> None:
         """Route to appropriate handler based on mode."""
@@ -1435,7 +1435,7 @@ class ModeHandler:
         handler = handlers.get(mode)
         if handler and transcribed_text:
             handler(transcribed_text)
-    
+
     @staticmethod
     def _handle_dictation(text: str) -> None:
         """Handle dictation mode: transcribe and type."""
@@ -1444,7 +1444,7 @@ class ModeHandler:
         ChatManager.add_message("user", f"🎤 {text}")
         ClipboardService.type_text(text)
         log.info("dictation_typed")
-    
+
     @staticmethod
     def _handle_ai(text: str) -> None:
         """Handle AI chat mode: get response and type."""
@@ -1466,7 +1466,7 @@ class ModeHandler:
         ClipboardService.type_text(response)
         log.info("ai_chat_complete", response_length=len(response))
         TTSService.speak(response)
-    
+
     @staticmethod
     def _handle_ai_rewrite(text: str) -> None:
         """Handle AI rewrite mode: rewrite selected text based on instruction."""
@@ -1497,7 +1497,7 @@ class ModeHandler:
         ClipboardService.paste_text(response)
         log.info("ai_rewrite_complete", response_length=len(response))
         TTSService.speak(response)
-    
+
     @staticmethod
     def _handle_vision(text: str) -> None:
         """Handle vision mode: screenshot + AI analysis."""
