@@ -3,8 +3,8 @@
 LinuxWhisper - Voice Assistant for Linux
 =========================================
 
-A voice-to-text and AI assistant tool that integrates with Groq APIs
-for transcription, chat completion, vision analysis, and text-to-speech.
+A voice-to-text and AI assistant tool that integrates with OpenAI-compatible APIs
+(LocalAI, Groq, OpenAI, etc.) for transcription, chat completion, vision analysis, and text-to-speech.
 
 ARCHITECTURE OVERVIEW
 ---------------------
@@ -60,17 +60,19 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 import cairo
 import gi
 import numpy as np
-import pyperclip
 import sounddevice as sd
-from groq import Groq
-from pynput import keyboard
+from dotenv import load_dotenv
+from openai import OpenAI
 from scipy.io.wavfile import write as wav_write
+
+# Load .env file from script directory
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 gi.require_version('Gtk', '3.0')
 gi.require_version('AyatanaAppIndicator3', '0.1')
 gi.require_version('WebKit2', '4.1')
 from gi.repository import AyatanaAppIndicator3 as AppIndicator
-from gi.repository import Gdk, GLib, Gtk, WebKit2
+from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2
 
 
 # ============================================================================
@@ -93,15 +95,15 @@ class Config:
     CHAT_MESSAGE_LIMIT: int = 20
     CHAT_AUTO_HIDE_SEC: int = 5
     
-    # --- AI Models ---
-    MODEL_CHAT: str = "moonshotai/kimi-k2-instruct"
-    MODEL_VISION: str = "meta-llama/llama-4-scout-17b-16e-instruct"
-    MODEL_WHISPER: str = "whisper-large-v3"
-    MODEL_TTS: str = "canopylabs/orpheus-v1-english"
+    # --- AI Models (defaults for LocalAI, override via .env) ---
+    MODEL_CHAT: str = os.environ.get("MODEL_CHAT", "gpt-4")
+    MODEL_VISION: str = os.environ.get("MODEL_VISION", "gpt-4-vision-preview")
+    MODEL_WHISPER: str = os.environ.get("MODEL_WHISPER", "whisper-1")
+    MODEL_TTS: str = os.environ.get("MODEL_TTS", "tts-1")
     
-    # --- TTS Voices ---
-    TTS_VOICES: Tuple[str, ...] = ("diana", "hannah", "autumn", "austin", "daniel", "troy")
-    TTS_DEFAULT_VOICE: str = "diana"
+    # --- TTS Voices (LocalAI/Piper voices - adjust based on installed models) ---
+    TTS_VOICES: Tuple[str, ...] = ("alloy", "echo", "fable", "onyx", "nova", "shimmer")
+    TTS_DEFAULT_VOICE: str = "alloy"
     TTS_MAX_CHARS: int = 4000
     
     # --- Temp File Paths ---
@@ -124,14 +126,15 @@ class Config:
         "vision":     {"icon": "📸", "text": "Vision Mode...",  "bg": "#1a1a2e", "fg": "#f59e0b"},
     })
 
-    # format: "id": (Label_fuer_UI, Primary_Key, List_of_Extra_VKs_or_MediaKeys)
-    HOTKEY_DEFS: Dict[str, Tuple[str, Any, List[Any]]] = field(default_factory=lambda: {
-        "dictation":  ("F3",  keyboard.Key.f3, [269025098]),
-        "ai":         ("F4",  keyboard.Key.f4, [269025099]),
-        "ai_rewrite": ("F7",  keyboard.Key.f7, [keyboard.Key.media_previous]),
-        "vision":     ("F8",  keyboard.Key.f8, [keyboard.Key.media_play_pause]),
-        "pin":        ("F9",  keyboard.Key.f9, [269025047, keyboard.Key.media_next]),
-        "tts":        ("F10", keyboard.Key.f10, [keyboard.Key.media_volume_mute]),
+    # format: "id": (Label_for_UI, shortcut_trigger, description)
+    # Shortcut triggers use XDG GlobalShortcuts format
+    HOTKEY_DEFS: Dict[str, Tuple[str, str, str]] = field(default_factory=lambda: {
+        "linuxwhisper-dictation":  ("F3",  "F3",  "Dictation - speech to text"),
+        "linuxwhisper-ai":         ("F4",  "F4",  "AI Chat assistant"),
+        "linuxwhisper-ai_rewrite": ("F7",  "F7",  "AI Rewrite selected text"),
+        "linuxwhisper-vision":     ("F8",  "F8",  "Vision - screenshot analysis"),
+        "linuxwhisper-pin":        ("F9",  "F9",  "Toggle chat pin"),
+        "linuxwhisper-tts":        ("F10", "F10", "Toggle text-to-speech"),
     })
 
 
@@ -190,16 +193,20 @@ STATE = AppState()
 # ============================================================================
 # SECTION 4: API CLIENT INITIALIZATION
 # ============================================================================
-def _init_groq_client() -> Groq:
-    """Initialize Groq API client with environment key."""
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        print("❌ Error: GROQ_API_KEY missing. Please check your environment variables!")
+def _init_openai_client() -> OpenAI:
+    """Initialize OpenAI-compatible API client."""
+    base_url = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+
+    if not api_key and "openai.com" in base_url:
+        print("❌ Error: OPENAI_API_KEY missing. Please check your .env file!")
         sys.exit(1)
-    return Groq(api_key=api_key)
+
+    # For local APIs like LocalAI, key can be anything
+    return OpenAI(base_url=base_url, api_key=api_key or "unused")
 
 
-GROQ_CLIENT = _init_groq_client()
+API_CLIENT = _init_openai_client()
 
 
 # ============================================================================
@@ -304,7 +311,7 @@ class AudioService:
         wav_write(wav_buffer, CFG.SAMPLE_RATE, audio_data)
         wav_buffer.seek(0)
         
-        transcript = GROQ_CLIENT.audio.transcriptions.create(
+        transcript = API_CLIENT.audio.transcriptions.create(
             model=CFG.MODEL_WHISPER,
             file=wav_buffer
         )
@@ -328,7 +335,7 @@ class AIService:
     def chat(prompt: str) -> Optional[str]:
         """Send chat completion request."""
         messages = AIService.build_messages(prompt)
-        response = GROQ_CLIENT.chat.completions.create(
+        response = API_CLIENT.chat.completions.create(
             model=CFG.MODEL_CHAT,
             messages=messages
         )
@@ -347,7 +354,7 @@ class AIService:
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}}
             ]
         }
-        response = GROQ_CLIENT.chat.completions.create(
+        response = API_CLIENT.chat.completions.create(
             model=CFG.MODEL_VISION,
             messages=messages
         )
@@ -366,7 +373,7 @@ class TTSService:
         
         def _speak_thread():
             try:
-                response = GROQ_CLIENT.audio.speech.create(
+                response = API_CLIENT.audio.speech.create(
                     model=CFG.MODEL_TTS,
                     voice=STATE.tts_voice,
                     input=text[:CFG.TTS_MAX_CHARS],
@@ -388,58 +395,62 @@ class TTSService:
 
 # --- Clipboard Service ---
 class ClipboardService:
-    """Clipboard operations for typing and pasting text."""
-    
+    """Clipboard operations for typing and pasting text (Wayland native)."""
+
     @staticmethod
     def type_text(text: str) -> None:
-        """Paste text at cursor via clipboard (fast)."""
+        """Paste text at cursor via clipboard (Wayland)."""
         if not text:
             return
-        
+
         # Save original clipboard
         try:
-            original = pyperclip.paste()
+            result = subprocess.run(["wl-paste", "--no-newline"], capture_output=True, text=True)
+            original = result.stdout if result.returncode == 0 else None
         except Exception:
             original = None
-        
+
         # Add leading space to prevent word merging
         clean_text = f" {text.strip()}" if not text.startswith(" ") else text
-        
-        # Paste via clipboard
-        pyperclip.copy(clean_text)
-        subprocess.run(["xdotool", "key", "ctrl+v"])
-        
+
+        # Copy to clipboard and paste via wtype
+        subprocess.run(["wl-copy", "--", clean_text], check=False)
+        subprocess.run(["wtype", "-M", "ctrl", "-P", "v", "-m", "ctrl", "-p", "v"], check=False)
+
         # Restore original clipboard after short delay
-        time.sleep(0.1)
+        time.sleep(0.15)
         if original is not None:
             try:
-                pyperclip.copy(original)
+                subprocess.run(["wl-copy", "--", original], check=False)
             except Exception:
                 pass
-    
+
     @staticmethod
     def copy_selected() -> str:
-        """Copy currently selected text and return it."""
-        subprocess.run(["xdotool", "key", "ctrl+c"])
+        """Copy currently selected text and return it (Wayland)."""
+        # Trigger copy via wtype
+        subprocess.run(["wtype", "-M", "ctrl", "-P", "c", "-m", "ctrl", "-p", "c"], check=False)
         time.sleep(0.1)
-        return pyperclip.paste().strip()
-    
+        result = subprocess.run(["wl-paste", "--no-newline"], capture_output=True, text=True)
+        return result.stdout.strip() if result.returncode == 0 else ""
+
     @staticmethod
     def paste_text(text: str) -> None:
-        """Paste text directly via clipboard."""
-        pyperclip.copy(text)
-        subprocess.run(["xdotool", "key", "ctrl+v"])
+        """Paste text directly via clipboard (Wayland)."""
+        subprocess.run(["wl-copy", "--", text], check=False)
+        subprocess.run(["wtype", "-M", "ctrl", "-P", "v", "-m", "ctrl", "-p", "v"], check=False)
 
 
 # --- Image Service ---
 class ImageService:
-    """Screenshot and image encoding service."""
-    
+    """Screenshot and image encoding service (Wayland native)."""
+
     @staticmethod
     @safe_execute("Screenshot")
     def take_screenshot() -> Optional[str]:
-        """Take screenshot and return base64 encoded string."""
-        subprocess.run(["gnome-screenshot", "-f", CFG.TEMP_SCREEN_PATH])
+        """Take screenshot and return base64 encoded string (using grim for Wayland)."""
+        # Use grim for Wayland screenshot
+        subprocess.run(["grim", CFG.TEMP_SCREEN_PATH], check=True)
         with open(CFG.TEMP_SCREEN_PATH, "rb") as f:
             encoded = base64.b64encode(f.read()).decode('utf-8')
         os.remove(CFG.TEMP_SCREEN_PATH)
@@ -1131,7 +1142,7 @@ class ChatOverlay(Gtk.Window):
                     idx = int(uri.split("copy://")[1])
                     if 0 <= idx < len(STATE.chat_messages):
                         text = STATE.chat_messages[idx]["text"]
-                        pyperclip.copy(text)
+                        subprocess.run(["wl-copy", "--", text], check=False)
                 except Exception:
                     pass
                 decision.ignore()
@@ -1407,7 +1418,8 @@ class ModeHandler:
     @staticmethod
     def _handle_ai_rewrite(text: str) -> None:
         """Handle AI rewrite mode: rewrite selected text based on instruction."""
-        original = pyperclip.paste().strip()
+        result = subprocess.run(["wl-paste", "--no-newline"], capture_output=True, text=True)
+        original = result.stdout.strip() if result.returncode == 0 else ""
         prompt = (
             f"INSTRUCTION:\n{text}\n\n"
             f"ORIGINAL TEXT:\n{original}\n\n"
@@ -1456,86 +1468,253 @@ class ModeHandler:
 
 
 # ============================================================================
-# SECTION 11: KEYBOARD HANDLER
+# SECTION 11: KEYBOARD HANDLER (D-Bus GlobalShortcuts Portal)
 # ============================================================================
-class KeyboardHandler:
-    """Global keyboard listener with data-driven key mappings."""
-    
-    # Generate mappings dynamically from CFG.HOTKEY_DEFS
-    # Format: mode_id -> list of all valid keys (primary + extras)
-    KEY_MAPPINGS: Dict[str, List[Any]] = {
-        mode_id: [data[1]] + data[2]
-        for mode_id, data in CFG.HOTKEY_DEFS.items()
-    }
-    
-    @classmethod
-    def check_key(cls, key, target_mode: str) -> bool:
-        """Check if pressed key matches target mode."""
-        valid_keys = cls.KEY_MAPPINGS.get(target_mode, [])
-        if key in valid_keys:
+class GlobalShortcutsHandler:
+    """
+    Global keyboard handler using XDG Desktop Portal GlobalShortcuts.
+
+    Works natively on Wayland (Hyprland, GNOME, KDE) without X11 dependency.
+    Uses Activated/Deactivated signals for push-to-talk functionality.
+    """
+
+    PORTAL_BUS = "org.freedesktop.portal.Desktop"
+    PORTAL_PATH = "/org/freedesktop/portal/desktop"
+    SHORTCUTS_IFACE = "org.freedesktop.portal.GlobalShortcuts"
+    REQUEST_IFACE = "org.freedesktop.portal.Request"
+
+    def __init__(self):
+        self.session_handle: Optional[str] = None
+        self.bus: Optional[Gio.DBusConnection] = None
+        self.signal_ids: List[int] = []
+
+    def start(self) -> bool:
+        """Initialize D-Bus connection and register shortcuts."""
+        try:
+            self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            self._create_session()
             return True
-        if hasattr(key, 'vk') and key.vk in valid_keys:
-            return True
-        return False
-    
-    @classmethod
-    def get_mode_for_key(cls, key) -> Optional[str]:
-        """Get mode name for a pressed key, if any."""
-        for mode in CFG.MODES:
-            if cls.check_key(key, mode):
-                return mode
-        return None
-    
-    @classmethod
-    def on_press(cls, key) -> None:
-        """Handle key press events."""
+        except Exception as e:
+            print(f"❌ GlobalShortcuts Error: {e}")
+            print("   Make sure xdg-desktop-portal-hyprland is running.")
+            return False
+
+    def _create_session(self) -> None:
+        """Create a GlobalShortcuts session (step 1 of 2)."""
+        # Generate unique token
+        token = f"linuxwhisper_{os.getpid()}"
+
+        # CreateSession without shortcuts first
+        options = {
+            "handle_token": GLib.Variant("s", token),
+            "session_handle_token": GLib.Variant("s", f"session_{token}"),
+        }
+
+        # Subscribe to Response signals BEFORE making the call
+        self.signal_ids.append(
+            self.bus.signal_subscribe(
+                self.PORTAL_BUS,
+                None,  # any interface
+                "Response",
+                None,  # any path
+                None,
+                Gio.DBusSignalFlags.NONE,
+                self._on_response
+            )
+        )
+
+        # Call CreateSession
+        result = self.bus.call_sync(
+            self.PORTAL_BUS,
+            self.PORTAL_PATH,
+            self.SHORTCUTS_IFACE,
+            "CreateSession",
+            GLib.Variant("(a{sv})", (options,)),
+            GLib.VariantType("(o)"),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None
+        )
+        print(f"   CreateSession request: {result.unpack()[0]}")
+
+    def _on_response(self, connection, sender, path, iface, signal, params) -> None:
+        """Handle all Response signals."""
+        response, results = params.unpack()
+
+        # Check if this is CreateSession response (has session_handle)
+        if "session_handle" in results and not self.session_handle:
+            self._on_create_session_response(response, results)
+        # Check if this is BindShortcuts response (has shortcuts)
+        elif "shortcuts" in results:
+            self._on_bind_shortcuts_response(response, results)
+
+    def _bind_shortcuts(self) -> None:
+        """Bind shortcuts to the session (step 2 of 2)."""
+        shortcuts = []
+        for mode_id, (label, trigger, description) in CFG.HOTKEY_DEFS.items():
+            shortcuts.append((
+                mode_id,
+                {
+                    "description": GLib.Variant("s", description),
+                    "preferred-trigger": GLib.Variant("s", trigger),
+                }
+            ))
+
+        result = self.bus.call_sync(
+            self.PORTAL_BUS,
+            self.PORTAL_PATH,
+            self.SHORTCUTS_IFACE,
+            "BindShortcuts",
+            GLib.Variant("(oa(sa{sv})sa{sv})", (self.session_handle, shortcuts, "", {})),
+            GLib.VariantType("(o)"),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None
+        )
+        print(f"   BindShortcuts request: {result.unpack()[0]}")
+
+    def _on_bind_shortcuts_response(self, response: int, results: dict) -> None:
+        """Handle BindShortcuts response."""
+        if response != 0:
+            print(f"❌ BindShortcuts failed (response: {response})")
+            return
+
+        shortcuts = results.get("shortcuts", [])
+        print(f"✓ {len(shortcuts)} shortcuts bound:")
+
+    def _on_create_session_response(self, response: int, results: dict) -> None:
+        """Handle CreateSession response."""
+        if response != 0:
+            print(f"❌ Failed to create GlobalShortcuts session (response: {response})")
+            return
+
+        self.session_handle = results.get("session_handle", None)
+        if not self.session_handle:
+            print("❌ No session handle received")
+            return
+
+        print(f"✓ GlobalShortcuts session: {self.session_handle}")
+
+        # Subscribe to Activated/Deactivated signals
+        self.signal_ids.append(
+            self.bus.signal_subscribe(
+                self.PORTAL_BUS,
+                self.SHORTCUTS_IFACE,
+                "Activated",
+                self.PORTAL_PATH,
+                None,
+                Gio.DBusSignalFlags.NONE,
+                self._on_activated
+            )
+        )
+
+        self.signal_ids.append(
+            self.bus.signal_subscribe(
+                self.PORTAL_BUS,
+                self.SHORTCUTS_IFACE,
+                "Deactivated",
+                self.PORTAL_PATH,
+                None,
+                Gio.DBusSignalFlags.NONE,
+                self._on_deactivated
+            )
+        )
+
+        # Now bind the shortcuts (step 2)
+        self._bind_shortcuts()
+
+    def _on_activated(self, connection, sender, path, iface, signal, params) -> None:
+        """Handle shortcut activation (key press)."""
+        session_handle, shortcut_id, timestamp, options = params.unpack()
+
+        # Verify it's our session
+        if session_handle != self.session_handle:
+            return
+
+        GLib.idle_add(self._handle_press, shortcut_id)
+
+    def _on_deactivated(self, connection, sender, path, iface, signal, params) -> None:
+        """Handle shortcut deactivation (key release)."""
+        session_handle, shortcut_id, timestamp, options = params.unpack()
+
+        # Verify it's our session
+        if session_handle != self.session_handle:
+            return
+
+        GLib.idle_add(self._handle_release, shortcut_id)
+
+    def _handle_press(self, shortcut_id: str) -> bool:
+        """Handle key press on main thread."""
         if STATE.recording:
-            return
-        
+            return False
+
+        # Extract mode from shortcut_id (e.g., "linuxwhisper-dictation" -> "dictation")
+        mode = shortcut_id.replace("linuxwhisper-", "") if shortcut_id.startswith("linuxwhisper-") else shortcut_id
+
         # Pin toggle (non-recording action)
-        if cls.check_key(key, "pin"):
+        if mode == "pin":
             ChatManager.toggle_pin()
-            return
-        
+            return False
+
         # TTS toggle (non-recording action)
-        if cls.check_key(key, "tts"):
+        if mode == "tts":
             TTSService.toggle()
-            return
-        
-        # Check for recording mode keys
-        mode = cls.get_mode_for_key(key)
-        if mode:
+            return False
+
+        # Check for recording mode
+        if mode in CFG.MODES:
             STATE.current_mode = mode
-            
+
             # For rewrite mode, copy selected text first
             if mode == "ai_rewrite":
-                subprocess.run(["xdotool", "key", "ctrl+c"])
+                subprocess.run(["wl-copy", "--primary"], capture_output=True)  # Wayland clipboard
+                subprocess.run(["wl-paste", "--primary"], capture_output=True)
                 time.sleep(0.1)
-            
+
             OverlayManager.show(mode)
             AudioService.start_recording()
-    
-    @classmethod
-    def on_release(cls, key) -> None:
-        """Handle key release events."""
+
+        return False
+
+    def _handle_release(self, shortcut_id: str) -> bool:
+        """Handle key release on main thread."""
         if not STATE.recording:
-            return
-        
+            return False
+
+        # Extract mode from shortcut_id
+        mode = shortcut_id.replace("linuxwhisper-", "") if shortcut_id.startswith("linuxwhisper-") else shortcut_id
+
         # Check if released key matches current mode
-        if cls.check_key(key, STATE.current_mode):
+        if mode == STATE.current_mode:
             OverlayManager.hide()
             audio_data = AudioService.stop_recording()
-            
+
             if audio_data is not None:
-                transcribed = AudioService.transcribe(audio_data)
-                if transcribed:
-                    ModeHandler.process(STATE.current_mode, transcribed)
-    
-    @classmethod
-    def run(cls) -> None:
-        """Start keyboard listener in current thread."""
-        with keyboard.Listener(on_press=cls.on_press, on_release=cls.on_release) as listener:
-            listener.join()
+                # Process in background thread
+                threading.Thread(
+                    target=self._process_audio,
+                    args=(audio_data, mode),
+                    daemon=True
+                ).start()
+
+        return False
+
+    def _process_audio(self, audio_data: np.ndarray, mode: str) -> None:
+        """Process recorded audio in background thread."""
+        transcribed = AudioService.transcribe(audio_data)
+        if transcribed:
+            GLib.idle_add(lambda: ModeHandler.process(mode, transcribed))
+
+    def stop(self) -> None:
+        """Clean up D-Bus subscriptions."""
+        if self.bus:
+            for signal_id in self.signal_ids:
+                self.bus.signal_unsubscribe(signal_id)
+            self.signal_ids = []
+
+
+# Global handler instance
+SHORTCUTS_HANDLER: Optional[GlobalShortcutsHandler] = None
 
 
 # ============================================================================
@@ -1543,28 +1722,25 @@ class KeyboardHandler:
 # ============================================================================
 def main() -> None:
     """Application entry point."""
+    global SHORTCUTS_HANDLER
+
     print("🚀 LinuxWhisper is running.")
-    
-    descriptions = {
-        "dictation": "Live dictation at cursor position (Whisper V3)",
-        "ai": "Empathic AI question (Groq Moonshot)",
-        "ai_rewrite": "Smart Rewrite - Highlight text & speak to edit",
-        "vision": "Empathic Vision / Screenshot (Groq Llama 4)",
-        "pin": "Toggle Chat Overlay Pin Mode",
-        "tts": "Toggle TTS (Read AI responses aloud)"
-    }
-    
-    i = 1
-    for mode_id, (label, _, _) in CFG.HOTKEY_DEFS.items():
-         desc = descriptions.get(mode_id, "Unknown Mode")
-         print(f" {i}. {label:<13}: {desc}")
-         i += 1
+    print("   Using D-Bus GlobalShortcuts (Wayland native)\n")
+
+    # Display configured shortcuts
+    for mode_id, (label, trigger, description) in CFG.HOTKEY_DEFS.items():
+        print(f"   {label:<6} : {description}")
+
     print("\n📌 System tray icon active")
-    
-    # Start keyboard listener in background thread
-    keyboard_thread = threading.Thread(target=KeyboardHandler.run, daemon=True)
-    keyboard_thread.start()
-    
+
+    # Initialize GlobalShortcuts handler
+    SHORTCUTS_HANDLER = GlobalShortcutsHandler()
+    if not SHORTCUTS_HANDLER.start():
+        print("\n⚠️  Falling back: GlobalShortcuts not available.")
+        print("   Ensure xdg-desktop-portal-hyprland is running:")
+        print("   $ systemctl --user status xdg-desktop-portal-hyprland")
+        sys.exit(1)
+
     # Run GTK main loop (blocks)
     TrayManager.start()
 
