@@ -40,6 +40,7 @@ F10: Toggle TTS (text-to-speech for AI responses)
 # ============================================================================
 from __future__ import annotations
 
+import argparse
 import base64
 import io
 import math
@@ -598,21 +599,24 @@ class ChatManager:
 # --- Recording Overlay ---
 class GtkOverlay(Gtk.Window):
     """Floating recording overlay with waveform visualization."""
-    
+
     def __init__(self, mode: str):
-        super().__init__(type=Gtk.WindowType.POPUP)
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.mode = mode
         self.config = CFG.MODES.get(mode, CFG.MODES["dictation"])
         self._setup_window()
         self._setup_ui()
         self.show_all()
-    
+
     def _setup_window(self) -> None:
         """Configure window properties."""
         self.set_app_paintable(True)
         self.set_decorated(False)
         self.set_keep_above(True)
-        
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
+
         # Enable transparency
         screen = self.get_screen()
         visual = screen.get_rgba_visual()
@@ -1720,9 +1724,66 @@ SHORTCUTS_HANDLER: Optional[GlobalShortcutsHandler] = None
 # ============================================================================
 # SECTION 12: MAIN ENTRY POINT
 # ============================================================================
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="LinuxWhisper - Voice Assistant for Linux",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Modes:
+  -d, --dictation    Start in dictation mode (speech-to-text)
+  -a, --ai           Start in AI chat mode
+  -r, --rewrite      Start in AI rewrite mode
+  -v, --vision       Start in vision mode (screenshot + AI)
+
+Without arguments, runs normally with hotkey support.
+Press the corresponding hotkey (F3/F4/F7/F8) to stop recording.
+        """
+    )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("-d", "--dictation", action="store_true",
+                           help="Start recording in dictation mode immediately")
+    mode_group.add_argument("-a", "--ai", action="store_true",
+                           help="Start recording in AI chat mode immediately")
+    mode_group.add_argument("-r", "--rewrite", action="store_true",
+                           help="Start recording in AI rewrite mode immediately")
+    mode_group.add_argument("-v", "--vision", action="store_true",
+                           help="Start recording in vision mode immediately")
+    return parser.parse_args()
+
+
+def start_immediate_mode(mode: str) -> bool:
+    """Start recording in specified mode immediately. Returns False to remove from idle."""
+    STATE.current_mode = mode
+
+    # For rewrite mode, ensure clipboard is ready
+    if mode == "ai_rewrite":
+        subprocess.run(["wl-paste", "--primary"], capture_output=True)
+        time.sleep(0.1)
+
+    OverlayManager.show(mode)
+    AudioService.start_recording()
+    print(f"\n🎤 Recording started in {mode} mode...")
+    print(f"   Press {CFG.HOTKEY_DEFS.get(f'linuxwhisper-{mode}', ('F3',))[0]} to stop and process.")
+    return False  # Remove from GLib.idle_add
+
+
 def main() -> None:
     """Application entry point."""
     global SHORTCUTS_HANDLER
+
+    args = parse_args()
+
+    # Determine if immediate mode requested
+    immediate_mode = None
+    if args.dictation:
+        immediate_mode = "dictation"
+    elif args.ai:
+        immediate_mode = "ai"
+    elif args.rewrite:
+        immediate_mode = "ai_rewrite"
+    elif args.vision:
+        immediate_mode = "vision"
 
     print("🚀 LinuxWhisper is running.")
     print("   Using D-Bus GlobalShortcuts (Wayland native)\n")
@@ -1740,6 +1801,10 @@ def main() -> None:
         print("   Ensure xdg-desktop-portal-hyprland is running:")
         print("   $ systemctl --user status xdg-desktop-portal-hyprland")
         sys.exit(1)
+
+    # Schedule immediate mode start after GTK is ready
+    if immediate_mode:
+        GLib.timeout_add(500, lambda: start_immediate_mode(immediate_mode))
 
     # Run GTK main loop (blocks)
     TrayManager.start()
