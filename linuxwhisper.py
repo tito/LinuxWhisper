@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import logging
 import math
 import os
 import queue
@@ -62,6 +63,7 @@ import cairo
 import gi
 import numpy as np
 import sounddevice as sd
+import structlog
 from dotenv import load_dotenv
 from openai import OpenAI
 from scipy.io.wavfile import write as wav_write
@@ -74,6 +76,20 @@ gi.require_version('AyatanaAppIndicator3', '0.1')
 gi.require_version('WebKit2', '4.1')
 from gi.repository import AyatanaAppIndicator3 as AppIndicator
 from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2
+
+# Configure structlog
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="%H:%M:%S"),
+        structlog.dev.ConsoleRenderer(colors=True),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    context_class=dict,
+    logger_factory=structlog.PrintLoggerFactory(),
+    cache_logger_on_first_use=True,
+)
+log = structlog.get_logger()
 
 
 # ============================================================================
@@ -200,7 +216,7 @@ def _init_openai_client() -> OpenAI:
     api_key = os.environ.get("OPENAI_API_KEY", "")
 
     if not api_key and "openai.com" in base_url:
-        print("❌ Error: OPENAI_API_KEY missing. Please check your .env file!")
+        log.error("OPENAI_API_KEY missing - check your .env file")
         sys.exit(1)
 
     # For local APIs like LocalAI, key can be anything
@@ -228,7 +244,7 @@ def safe_execute(operation: str) -> Callable:
             try:
                 return func(*args, **kwargs)
             except Exception as e:
-                print(f"❌ {operation} Error: {e}")
+                log.error("operation_failed", operation=operation, error=str(e))
                 return None
         return wrapper
     return decorator
@@ -306,17 +322,22 @@ class AudioService:
     @staticmethod
     @safe_execute("Transcription")
     def transcribe(audio_data: np.ndarray) -> Optional[str]:
-        """Transcribe audio using Groq Whisper."""
+        """Transcribe audio using Whisper."""
+        duration_sec = len(audio_data) / CFG.SAMPLE_RATE
+        log.info("transcribe_start", model=CFG.MODEL_WHISPER, audio_duration_sec=round(duration_sec, 1))
+
         wav_buffer = io.BytesIO()
         wav_buffer.name = "audio.wav"
         wav_write(wav_buffer, CFG.SAMPLE_RATE, audio_data)
         wav_buffer.seek(0)
-        
+
         transcript = API_CLIENT.audio.transcriptions.create(
             model=CFG.MODEL_WHISPER,
             file=wav_buffer
         )
-        return transcript.text.strip()
+        result = transcript.text.strip()
+        log.info("transcribe_complete", text_length=len(result), text_preview=result[:80] if result else "")
+        return result
 
 
 # --- AI Service ---
@@ -335,17 +356,21 @@ class AIService:
     @safe_execute("AI Chat")
     def chat(prompt: str) -> Optional[str]:
         """Send chat completion request."""
+        log.info("chat_start", model=CFG.MODEL_CHAT, prompt_length=len(prompt))
         messages = AIService.build_messages(prompt)
         response = API_CLIENT.chat.completions.create(
             model=CFG.MODEL_CHAT,
             messages=messages
         )
-        return response.choices[0].message.content
+        result = response.choices[0].message.content
+        log.info("chat_complete", response_length=len(result) if result else 0)
+        return result
     
     @staticmethod
     @safe_execute("AI Vision")
     def vision(prompt: str, image_base64: str) -> Optional[str]:
         """Send vision completion request with image."""
+        log.info("vision_start", model=CFG.MODEL_VISION, prompt_length=len(prompt), image_size_kb=len(image_base64) // 1024)
         messages = AIService.build_messages(prompt)
         # Replace last user message with multimodal content
         messages[-1] = {
@@ -359,7 +384,9 @@ class AIService:
             model=CFG.MODEL_VISION,
             messages=messages
         )
-        return response.choices[0].message.content
+        result = response.choices[0].message.content
+        log.info("vision_complete", response_length=len(result) if result else 0)
+        return result
 
 
 # --- TTS Service ---
@@ -371,9 +398,10 @@ class TTSService:
         """Convert text to speech and play (async)."""
         if not STATE.tts_enabled or not text:
             return
-        
+
         def _speak_thread():
             try:
+                log.info("tts_start", model=CFG.MODEL_TTS, voice=STATE.tts_voice, text_length=min(len(text), CFG.TTS_MAX_CHARS))
                 response = API_CLIENT.audio.speech.create(
                     model=CFG.MODEL_TTS,
                     voice=STATE.tts_voice,
@@ -381,10 +409,11 @@ class TTSService:
                     response_format="wav"
                 )
                 response.write_to_file(CFG.TEMP_TTS_PATH)
+                log.info("tts_complete", output_file=CFG.TEMP_TTS_PATH)
                 subprocess.run(["aplay", "-q", CFG.TEMP_TTS_PATH], capture_output=True)
             except Exception as e:
-                print(f"❌ TTS Error: {e}")
-        
+                log.error("tts_failed", error=str(e))
+
         threading.Thread(target=_speak_thread, daemon=True).start()
     
     @staticmethod
@@ -1396,27 +1425,32 @@ class ModeHandler:
     @staticmethod
     def _handle_dictation(text: str) -> None:
         """Handle dictation mode: transcribe and type."""
+        log.info("dictation_complete", text_length=len(text))
         HistoryManager.add_answer(f"[Dictation] {text}")
         ChatManager.add_message("user", f"🎤 {text}")
         ClipboardService.type_text(text)
+        log.info("dictation_typed")
     
     @staticmethod
     def _handle_ai(text: str) -> None:
         """Handle AI chat mode: get response and type."""
+        log.info("ai_chat_request", prompt_length=len(text))
         response = AIService.chat(text)
         if not response:
+            log.warning("ai_chat_no_response")
             return
-        
+
         # Update histories
         HistoryManager.add_message("user", text)
         HistoryManager.add_message("assistant", response)
         HistoryManager.add_answer(response)
-        
+
         # Update chat overlay
         ChatManager.add_message("user", text)
         ChatManager.add_message("assistant", response)
-        
+
         ClipboardService.type_text(response)
+        log.info("ai_chat_complete", response_length=len(response))
         TTSService.speak(response)
     
     @staticmethod
@@ -1424,50 +1458,57 @@ class ModeHandler:
         """Handle AI rewrite mode: rewrite selected text based on instruction."""
         result = subprocess.run(["wl-paste", "--no-newline"], capture_output=True, text=True)
         original = result.stdout.strip() if result.returncode == 0 else ""
+        log.info("ai_rewrite_request", instruction_length=len(text), original_length=len(original))
         prompt = (
             f"INSTRUCTION:\n{text}\n\n"
             f"ORIGINAL TEXT:\n{original}\n\n"
             "Rewrite the original text based on the instruction. "
             "Output ONLY the finished text, without introduction or formatting."
         )
-        
+
         response = AIService.chat(prompt)
         if not response:
+            log.warning("ai_rewrite_no_response")
             return
-        
+
         # Update histories
         HistoryManager.add_message("user", f"[Rewrite] {text}\nOriginal: {original[:200]}...")
         HistoryManager.add_message("assistant", response)
         HistoryManager.add_answer(response)
-        
+
         # Update chat overlay
         ChatManager.add_message("user", f"✍️ {text}")
         ChatManager.add_message("assistant", response)
-        
+
         ClipboardService.paste_text(response)
+        log.info("ai_rewrite_complete", response_length=len(response))
         TTSService.speak(response)
     
     @staticmethod
     def _handle_vision(text: str) -> None:
         """Handle vision mode: screenshot + AI analysis."""
+        log.info("vision_request", prompt_length=len(text))
         image_b64 = ImageService.take_screenshot()
         if not image_b64:
+            log.warning("vision_screenshot_failed")
             return
-        
+
         response = AIService.vision(text, image_b64)
         if not response:
+            log.warning("vision_no_response")
             return
-        
+
         # Update histories
         HistoryManager.add_message("user", f"[Screenshot] {text}")
         HistoryManager.add_message("assistant", response)
         HistoryManager.add_answer(response)
-        
+
         # Update chat overlay
         ChatManager.add_message("user", f"📸 {text}")
         ChatManager.add_message("assistant", response)
-        
+
         ClipboardService.type_text(response)
+        log.info("vision_complete", response_length=len(response))
         TTSService.speak(response)
 
 
@@ -1499,8 +1540,7 @@ class GlobalShortcutsHandler:
             self._create_session()
             return True
         except Exception as e:
-            print(f"❌ GlobalShortcuts Error: {e}")
-            print("   Make sure xdg-desktop-portal-hyprland is running.")
+            log.error("globalshortcuts_init_failed", error=str(e), hint="Make sure xdg-desktop-portal-hyprland is running")
             return False
 
     def _create_session(self) -> None:
@@ -1539,7 +1579,7 @@ class GlobalShortcutsHandler:
             -1,
             None
         )
-        print(f"   CreateSession request: {result.unpack()[0]}")
+        log.debug("dbus_create_session_request", request_path=result.unpack()[0])
 
     def _on_response(self, connection, sender, path, iface, signal, params) -> None:
         """Handle all Response signals."""
@@ -1575,29 +1615,29 @@ class GlobalShortcutsHandler:
             -1,
             None
         )
-        print(f"   BindShortcuts request: {result.unpack()[0]}")
+        log.debug("dbus_bind_shortcuts_request", request_path=result.unpack()[0])
 
     def _on_bind_shortcuts_response(self, response: int, results: dict) -> None:
         """Handle BindShortcuts response."""
         if response != 0:
-            print(f"❌ BindShortcuts failed (response: {response})")
+            log.error("bind_shortcuts_failed", response=response)
             return
 
         shortcuts = results.get("shortcuts", [])
-        print(f"✓ {len(shortcuts)} shortcuts bound:")
+        log.info("shortcuts_bound", count=len(shortcuts))
 
     def _on_create_session_response(self, response: int, results: dict) -> None:
         """Handle CreateSession response."""
         if response != 0:
-            print(f"❌ Failed to create GlobalShortcuts session (response: {response})")
+            log.error("globalshortcuts_session_failed", response=response)
             return
 
         self.session_handle = results.get("session_handle", None)
         if not self.session_handle:
-            print("❌ No session handle received")
+            log.error("globalshortcuts_no_session_handle")
             return
 
-        print(f"✓ GlobalShortcuts session: {self.session_handle}")
+        log.info("globalshortcuts_session_created", session_handle=self.session_handle)
 
         # Subscribe to Activated/Deactivated signals
         self.signal_ids.append(
@@ -1654,20 +1694,24 @@ class GlobalShortcutsHandler:
 
         # Extract mode from shortcut_id (e.g., "linuxwhisper-dictation" -> "dictation")
         mode = shortcut_id.replace("linuxwhisper-", "") if shortcut_id.startswith("linuxwhisper-") else shortcut_id
+        log.debug("hotkey_pressed", shortcut_id=shortcut_id, mode=mode)
 
         # Pin toggle (non-recording action)
         if mode == "pin":
             ChatManager.toggle_pin()
+            log.info("chat_pin_toggled", pinned=STATE.chat_pinned)
             return False
 
         # TTS toggle (non-recording action)
         if mode == "tts":
             TTSService.toggle()
+            log.info("tts_toggled", enabled=STATE.tts_enabled)
             return False
 
         # Check for recording mode
         if mode in CFG.MODES:
             STATE.current_mode = mode
+            log.info("recording_start", mode=mode)
 
             # For rewrite mode, copy selected text first
             if mode == "ai_rewrite":
@@ -1687,11 +1731,13 @@ class GlobalShortcutsHandler:
 
         # Extract mode from shortcut_id
         mode = shortcut_id.replace("linuxwhisper-", "") if shortcut_id.startswith("linuxwhisper-") else shortcut_id
+        log.debug("hotkey_released", shortcut_id=shortcut_id, mode=mode)
 
         # Check if released key matches current mode
         if mode == STATE.current_mode:
             OverlayManager.hide()
             audio_data = AudioService.stop_recording()
+            log.info("recording_stop", mode=mode, has_audio=audio_data is not None)
 
             if audio_data is not None:
                 # Process in background thread
@@ -1705,9 +1751,13 @@ class GlobalShortcutsHandler:
 
     def _process_audio(self, audio_data: np.ndarray, mode: str) -> None:
         """Process recorded audio in background thread."""
+        log.info("processing_audio", mode=mode)
         transcribed = AudioService.transcribe(audio_data)
         if transcribed:
+            log.info("dispatching_to_handler", mode=mode, text_preview=transcribed[:50])
             GLib.idle_add(lambda: ModeHandler.process(mode, transcribed))
+        else:
+            log.warning("transcription_empty", mode=mode)
 
     def stop(self) -> None:
         """Clean up D-Bus subscriptions."""
@@ -1763,8 +1813,8 @@ def start_immediate_mode(mode: str) -> bool:
 
     OverlayManager.show(mode)
     AudioService.start_recording()
-    print(f"\n🎤 Recording started in {mode} mode...")
-    print(f"   Press {CFG.HOTKEY_DEFS.get(f'linuxwhisper-{mode}', ('F3',))[0]} to stop and process.")
+    hotkey = CFG.HOTKEY_DEFS.get(f'linuxwhisper-{mode}', ('F3',))[0]
+    log.info("recording_started", mode=mode, stop_key=hotkey)
     return False  # Remove from GLib.idle_add
 
 
@@ -1785,21 +1835,18 @@ def main() -> None:
     elif args.vision:
         immediate_mode = "vision"
 
-    print("🚀 LinuxWhisper is running.")
-    print("   Using D-Bus GlobalShortcuts (Wayland native)\n")
+    log.info("app_starting", transport="D-Bus GlobalShortcuts (Wayland native)")
 
-    # Display configured shortcuts
+    # Log configured shortcuts
     for mode_id, (label, trigger, description) in CFG.HOTKEY_DEFS.items():
-        print(f"   {label:<6} : {description}")
+        log.info("hotkey_registered", key=label, description=description)
 
-    print("\n📌 System tray icon active")
+    log.info("system_tray_active")
 
     # Initialize GlobalShortcuts handler
     SHORTCUTS_HANDLER = GlobalShortcutsHandler()
     if not SHORTCUTS_HANDLER.start():
-        print("\n⚠️  Falling back: GlobalShortcuts not available.")
-        print("   Ensure xdg-desktop-portal-hyprland is running:")
-        print("   $ systemctl --user status xdg-desktop-portal-hyprland")
+        log.error("globalshortcuts_unavailable", hint="Ensure xdg-desktop-portal-hyprland is running: systemctl --user status xdg-desktop-portal-hyprland")
         sys.exit(1)
 
     # Schedule immediate mode start after GTK is ready
