@@ -105,6 +105,7 @@ class Config:
     """
     # --- Audio Settings ---
     SAMPLE_RATE: int = 44100
+    AUDIO_DEVICE: Optional[str] = os.environ.get("AUDIO_DEVICE", "pipewire")
     
     # --- History Limits ---
     MAX_TOKENS: int = 32000
@@ -269,9 +270,11 @@ class AudioService:
     @staticmethod
     def audio_callback(indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
         """Capture audio chunks into buffer while recording."""
+        if status:
+            log.warning("audio_callback_status", status=str(status))
         if not STATE.recording:
             return
-        
+
         data_copy = indata.copy()
         STATE.audio_buffer.append(data_copy)
         
@@ -288,26 +291,37 @@ class AudioService:
         """Start audio recording stream."""
         STATE.audio_buffer = []
         AudioService._clear_viz_queue()
-        STATE.stream = sd.InputStream(
-            samplerate=CFG.SAMPLE_RATE,
-            channels=1,
-            dtype='float32',
-            callback=AudioService.audio_callback
-        )
-        STATE.stream.start()
-        STATE.recording = True
+        STATE.recording = True  # Set BEFORE starting stream to avoid race condition
+        try:
+            STATE.stream = sd.InputStream(
+                samplerate=CFG.SAMPLE_RATE,
+                channels=1,
+                dtype='float32',
+                device=CFG.AUDIO_DEVICE,
+                callback=AudioService.audio_callback
+            )
+            STATE.stream.start()
+            log.info("audio_stream_started", device=CFG.AUDIO_DEVICE)
+        except Exception as e:
+            STATE.recording = False
+            log.error("audio_stream_failed", error=str(e))
     
     @staticmethod
     def stop_recording() -> Optional[np.ndarray]:
         """Stop recording and return audio data."""
         STATE.recording = False
+        chunks = len(STATE.audio_buffer)
+        log.info("audio_stop", chunks_captured=chunks, stream_active=STATE.stream is not None)
         if STATE.stream:
             STATE.stream.stop()
             STATE.stream.close()
             STATE.stream = None
-        
+
         if STATE.audio_buffer:
-            return np.concatenate(STATE.audio_buffer, axis=0)
+            audio = np.concatenate(STATE.audio_buffer, axis=0)
+            log.info("audio_buffer_ready", samples=len(audio), duration_sec=round(len(audio) / CFG.SAMPLE_RATE, 2))
+            return audio
+        log.warning("audio_buffer_empty")
         return None
     
     @staticmethod
